@@ -24,8 +24,6 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use ring::aead;
-
 use libc::c_int;
 use libc::c_void;
 
@@ -33,6 +31,9 @@ use crate::Error;
 use crate::Result;
 
 use crate::packet;
+
+// All the AEAD algorithms we support use 96-bit nonces.
+pub const MAX_NONCE_LEN: usize = 12;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,17 +68,9 @@ pub enum Algorithm {
     ChaCha20_Poly1305,
 }
 
+// Note: some vendor-specific methods are implemented by each vendor's submodule
+// (openssl-quictls / boringssl).
 impl Algorithm {
-    // Note: some vendor-specific methods are implemented by each vendor's
-    // submodule (openssl-quictls / boringssl).
-    fn get_ring_hp(self) -> &'static aead::quic::Algorithm {
-        match self {
-            Algorithm::AES128_GCM => &aead::quic::AES_128,
-            Algorithm::AES256_GCM => &aead::quic::AES_256,
-            Algorithm::ChaCha20_Poly1305 => &aead::quic::CHACHA20,
-        }
-    }
-
     fn get_evp_digest(self) -> *const EVP_MD {
         match self {
             Algorithm::AES128_GCM => unsafe { EVP_sha256() },
@@ -86,7 +79,7 @@ impl Algorithm {
         }
     }
 
-    pub fn key_len(self) -> usize {
+    pub const fn key_len(self) -> usize {
         match self {
             Algorithm::AES128_GCM => 16,
             Algorithm::AES256_GCM => 32,
@@ -94,7 +87,7 @@ impl Algorithm {
         }
     }
 
-    pub fn tag_len(self) -> usize {
+    pub const fn tag_len(self) -> usize {
         if cfg!(feature = "fuzzing") {
             return 0;
         }
@@ -106,7 +99,7 @@ impl Algorithm {
         }
     }
 
-    pub fn nonce_len(self) -> usize {
+    pub const fn nonce_len(self) -> usize {
         match self {
             Algorithm::AES128_GCM => 12,
             Algorithm::AES256_GCM => 12,
@@ -140,6 +133,7 @@ pub struct Open {
 impl Open {
     // Note: some vendor-specific methods are implemented by each vendor's
     // submodule (openssl-quictls / boringssl).
+
     pub const DECRYPT: u32 = 0;
 
     pub fn new(
@@ -174,13 +168,7 @@ impl Open {
             return Ok(<[u8; 5]>::default());
         }
 
-        let mask = self
-            .header
-            .hpk
-            .new_mask(sample)
-            .map_err(|_| Error::CryptoFail)?;
-
-        Ok(mask)
+        self.header.new_mask(sample)
     }
 
     pub fn alg(&self) -> Algorithm {
@@ -198,13 +186,20 @@ impl Open {
 
             secret: next_secret,
 
-            header: HeaderProtectionKey::new(
-                self.alg,
-                self.header.hp_key.clone(),
-            )?,
+            header: self.header.clone(),
 
             packet: next_packet_key,
         })
+    }
+
+    pub fn open_with_u64_counter(
+        &self, counter: u64, ad: &[u8], buf: &mut [u8],
+    ) -> Result<usize> {
+        if cfg!(feature = "fuzzing") {
+            return Ok(buf.len());
+        }
+
+        self.packet.open_with_u64_counter(counter, ad, buf)
     }
 }
 
@@ -221,7 +216,8 @@ pub struct Seal {
 impl Seal {
     // Note: some vendor-specific methods are implemented by each vendor's
     // submodule (openssl-quictls / boringssl).
-    const ENCRYPT: u32 = 1;
+
+    pub const ENCRYPT: u32 = 1;
 
     pub fn new(
         alg: Algorithm, key: Vec<u8>, iv: Vec<u8>, hp_key: Vec<u8>,
@@ -265,13 +261,7 @@ impl Seal {
             return Ok(<[u8; 5]>::default());
         }
 
-        let mask = self
-            .header
-            .hpk
-            .new_mask(sample)
-            .map_err(|_| Error::CryptoFail)?;
-
-        Ok(mask)
+        self.header.new_mask(sample)
     }
 
     pub fn alg(&self) -> Algorithm {
@@ -289,29 +279,31 @@ impl Seal {
 
             secret: next_secret,
 
-            header: HeaderProtectionKey::new(
-                self.alg,
-                self.header.hp_key.clone(),
-            )?,
+            header: self.header.clone(),
 
             packet: next_packet_key,
         })
     }
-}
 
-pub struct HeaderProtectionKey {
-    hpk: aead::quic::HeaderProtectionKey,
+    pub fn seal_with_u64_counter(
+        &self, counter: u64, ad: &[u8], buf: &mut [u8], in_len: usize,
+        extra_in: Option<&[u8]>,
+    ) -> Result<usize> {
+        if cfg!(feature = "fuzzing") {
+            if let Some(extra) = extra_in {
+                buf[in_len..in_len + extra.len()].copy_from_slice(extra);
+                return Ok(in_len + extra.len());
+            }
 
-    hp_key: Vec<u8>,
+            return Ok(in_len);
+        }
+
+        self.packet
+            .seal_with_u64_counter(counter, ad, buf, in_len, extra_in)
+    }
 }
 
 impl HeaderProtectionKey {
-    pub fn new(alg: Algorithm, hp_key: Vec<u8>) -> Result<Self> {
-        aead::quic::HeaderProtectionKey::new(alg.get_ring_hp(), &hp_key)
-            .map(|hpk| Self { hpk, hp_key })
-            .map_err(|_| Error::CryptoFail)
-    }
-
     pub fn from_secret(aead: Algorithm, secret: &[u8]) -> Result<Self> {
         let key_len = aead.key_len();
 
@@ -469,8 +461,8 @@ fn hkdf_expand_label(
     Ok(())
 }
 
-fn make_nonce(iv: &[u8], counter: u64) -> [u8; aead::NONCE_LEN] {
-    let mut nonce = [0; aead::NONCE_LEN];
+fn make_nonce(iv: &[u8], counter: u64) -> [u8; MAX_NONCE_LEN] {
+    let mut nonce = [0; MAX_NONCE_LEN];
     nonce.copy_from_slice(iv);
 
     // XOR the last bytes of the IV with the counter. This is equivalent to
@@ -496,7 +488,7 @@ pub fn verify_slices_are_equal(a: &[u8], b: &[u8]) -> Result<()> {
     Err(Error::CryptoFail)
 }
 
-extern {
+extern "C" {
     fn EVP_sha256() -> *const EVP_MD;
 
     fn EVP_sha384() -> *const EVP_MD;
@@ -639,9 +631,9 @@ mod tests {
 #[cfg(not(feature = "openssl"))]
 mod boringssl;
 #[cfg(not(feature = "openssl"))]
-use boringssl::*;
+pub(crate) use boringssl::*;
 
 #[cfg(feature = "openssl")]
 mod openssl_quictls;
 #[cfg(feature = "openssl")]
-use openssl_quictls::*;
+pub(crate) use openssl_quictls::*;

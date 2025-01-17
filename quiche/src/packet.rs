@@ -30,8 +30,6 @@ use std::ops::IndexMut;
 use std::ops::RangeInclusive;
 use std::time;
 
-use ring::aead;
-
 use crate::Error;
 use crate::Result;
 
@@ -52,6 +50,8 @@ pub const MAX_CID_LEN: u8 = 20;
 pub const MAX_PKT_NUM_LEN: usize = 4;
 
 const SAMPLE_LEN: usize = 16;
+
+const RETRY_AEAD_ALG: crypto::Algorithm = crypto::Algorithm::AES128_GCM;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Epoch {
@@ -403,12 +403,14 @@ impl<'a> Header<'a> {
             },
 
             Type::Retry => {
+                const TAG_LEN: usize = RETRY_AEAD_ALG.tag_len();
+
                 // Exclude the integrity tag from the token.
-                if b.cap() < aead::AES_128_GCM.tag_len() {
+                if b.cap() < TAG_LEN {
                     return Err(Error::InvalidPacket);
                 }
 
-                let token_len = b.cap() - aead::AES_128_GCM.tag_len();
+                let token_len = b.cap() - TAG_LEN;
                 token = Some(b.get_bytes(token_len)?.to_vec());
             },
 
@@ -776,23 +778,25 @@ pub fn retry(
 pub fn verify_retry_integrity(
     b: &octets::OctetsMut, odcid: &[u8], version: u32,
 ) -> Result<()> {
+    const TAG_LEN: usize = RETRY_AEAD_ALG.tag_len();
+
     let tag = compute_retry_integrity_tag(b, odcid, version)?;
 
-    crypto::verify_slices_are_equal(
-        &b.as_ref()[..aead::AES_128_GCM.tag_len()],
-        tag.as_ref(),
-    )
+    crypto::verify_slices_are_equal(&b.as_ref()[..TAG_LEN], tag.as_ref())
 }
 
 fn compute_retry_integrity_tag(
     b: &octets::OctetsMut, odcid: &[u8], version: u32,
-) -> Result<aead::Tag> {
-    const RETRY_INTEGRITY_KEY_V1: [u8; 16] = [
+) -> Result<Vec<u8>> {
+    const KEY_LEN: usize = RETRY_AEAD_ALG.key_len();
+    const TAG_LEN: usize = RETRY_AEAD_ALG.tag_len();
+
+    const RETRY_INTEGRITY_KEY_V1: [u8; KEY_LEN] = [
         0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54,
         0xe3, 0x68, 0xc8, 0x4e,
     ];
 
-    const RETRY_INTEGRITY_NONCE_V1: [u8; aead::NONCE_LEN] = [
+    const RETRY_INTEGRITY_NONCE_V1: [u8; crypto::MAX_NONCE_LEN] = [
         0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
     ];
 
@@ -813,17 +817,23 @@ fn compute_retry_integrity_tag(
     pb.put_bytes(odcid)?;
     pb.put_bytes(&b.buf()[..hdr_len])?;
 
-    let key = aead::LessSafeKey::new(
-        aead::UnboundKey::new(&aead::AES_128_GCM, key)
-            .map_err(|_| Error::CryptoFail)?,
-    );
+    let key = crypto::PacketKey::new(
+        RETRY_AEAD_ALG,
+        key.to_vec(),
+        nonce.to_vec(),
+        crypto::Seal::ENCRYPT,
+    )?;
 
-    let nonce = aead::Nonce::assume_unique_for_key(nonce);
+    let mut out_tag = vec![0_u8; TAG_LEN];
 
-    let aad = aead::Aad::from(&pseudo);
+    let out_len = key.seal_with_u64_counter(0, &pseudo, &mut out_tag, 0, None)?;
 
-    key.seal_in_place_separate_tag(nonce, aad, &mut [])
-        .map_err(|_| Error::CryptoFail)
+    // Ensure that the output only contains the AEAD tag.
+    if out_len != out_tag.len() {
+        return Err(Error::CryptoFail);
+    }
+
+    Ok(out_tag)
 }
 
 pub struct KeyUpdate {
